@@ -218,6 +218,7 @@ All packages are installed via `npm install`. Key dependencies:
 - **Google Search grounding** – Answers include cited web sources for factual queries
 - **Python code execution** – Gemini writes and runs Python for plots, regression, histogram, scatter, and any analysis the JS tools can't handle
 - **CSV upload** – Drag-and-drop or click to attach a CSV; a slim version of the data (key columns as plain text) plus a full statistical summary are sent to Gemini automatically
+- **YouTube Channel Download tab** – After login, download metadata for up to 100 recent channel videos (title, description, duration, published date, view/like/comment counts, video URL, thumbnail URL, transcript if available) as a JSON file
 - **Auto-computed engagement column** – When a CSV has `Favorite Count` and `View Count` columns, an `engagement` ratio (Favorite Count / View Count) is added automatically to every row
 - **Client-side data analysis tools** – Fast, zero-cost function-calling tools that run in the browser. Gemini calls these automatically for data questions; results are saved to MongoDB alongside the message:
   - `compute_column_stats(column)` – mean, median, std, min, max, count for any numeric column
@@ -226,6 +227,23 @@ All packages are installed via `npm install`. Key dependencies:
 - **Tool routing logic** – The app automatically routes requests: client-side JS tools for simple stats, Python code execution for plots and complex models, Google Search for factual queries
 - **Markdown rendering** – AI responses render headers, lists, code blocks, tables, and links
 - **Image support** – Attach images via drag-and-drop, the 📎 button, or paste from clipboard (Ctrl+V)
+
+## YouTube Channel Download (HW5 Part 2)
+
+After login, open the **“YouTube Channel Download”** tab in the sidebar.
+
+- **Inputs**: channel URL (supports `https://www.youtube.com/@handle`, `/channel/CHANNEL_ID`, `/c/customname`) and max videos (default 10, max 100)
+- **Progress**: shows a progress bar as each video finishes downloading
+- **Output**: click **Download JSON** to save the results locally
+
+### Notes
+
+- **No YouTube API key required**: the backend uses `yt-dlp` server-side to fetch metadata reliably and avoid browser CORS issues.
+- **Transcripts are best-effort**: if a transcript isn’t available for a video, `transcript` is `null` and the download continues.
+
+### Sample output for grading
+
+- `public/veritasium_channel_10.json` contains a 10-video sample for `https://www.youtube.com/@veritasium`.
 
 ## Chat System Prompt
 

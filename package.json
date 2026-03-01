@@ -20,7 +20,9 @@
     "react-scripts": "5.0.1",
     "recharts": "^3.7.0",
     "remark-gfm": "^1.0.0",
-    "web-vitals": "^2.1.4"
+    "web-vitals": "^2.1.4",
+    "youtube-transcript": "^1.2.1",
+    "yt-dlp-wrap": "^2.3.12"
   },
   "scripts": {
     "start": "concurrently \"npm run server\" \"npm run client\"",

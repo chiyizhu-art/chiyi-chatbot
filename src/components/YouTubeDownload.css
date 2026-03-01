@@ -1,0 +1,168 @@
+.yt-page {
+  padding: 1.4rem 1.2rem;
+  height: 100%;
+  overflow: auto;
+}
+
+.yt-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.yt-title {
+  margin: 0;
+  font-size: 1.1rem;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.95);
+}
+
+.yt-subtitle {
+  margin: 0.35rem 0 0;
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 0.85rem;
+  line-height: 1.35;
+  max-width: 720px;
+}
+
+.yt-user {
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 0.8rem;
+  padding-top: 0.2rem;
+}
+
+.yt-user-name {
+  color: rgba(255, 255, 255, 0.9);
+  font-weight: 600;
+}
+
+.yt-card {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  padding: 1rem;
+  max-width: 820px;
+}
+
+.yt-label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  color: rgba(255, 255, 255, 0.75);
+  font-size: 0.8rem;
+  margin-bottom: 0.9rem;
+}
+
+.yt-input {
+  padding: 0.65rem 0.75rem;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(0, 0, 0, 0.18);
+  color: rgba(255, 255, 255, 0.9);
+  outline: none;
+  font-size: 0.9rem;
+}
+
+.yt-input:disabled {
+  opacity: 0.7;
+}
+
+.yt-btn {
+  padding: 0.65rem 0.9rem;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 0.92);
+  font-weight: 650;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.yt-btn:hover {
+  background: rgba(255, 255, 255, 0.16);
+  border-color: rgba(255, 255, 255, 0.22);
+}
+
+.yt-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.yt-btn.secondary {
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.yt-progress-wrap {
+  margin-top: 0.9rem;
+}
+
+.yt-progress-meta {
+  display: flex;
+  justify-content: space-between;
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 0.8rem;
+  margin-bottom: 0.35rem;
+}
+
+.yt-progress-bar {
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.yt-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, rgba(255, 215, 0, 0.8), rgba(255, 255, 255, 0.35));
+  width: 0%;
+  transition: width 0.2s ease;
+}
+
+.yt-errors {
+  margin-top: 0.9rem;
+  padding: 0.85rem;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.03);
+  color: rgba(255, 255, 255, 0.75);
+}
+
+.yt-errors-title {
+  font-weight: 700;
+  margin-bottom: 0.35rem;
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.yt-errors ul {
+  margin: 0;
+  padding-left: 1.1rem;
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+
+.yt-errors-more {
+  margin-top: 0.4rem;
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 0.78rem;
+}
+
+.yt-done {
+  margin-top: 1rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.yt-done-meta {
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.yt-done-job {
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 0.8rem;
+}
+

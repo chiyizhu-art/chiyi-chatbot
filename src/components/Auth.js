@@ -7,6 +7,8 @@ export default function Auth({ onLogin }) {
   const [username, setUsername] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [firstName, setFirstName] = useState('');
+  const [lastName, setLastName] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
@@ -17,15 +19,20 @@ export default function Auth({ onLogin }) {
     try {
       const name = username.trim().toLowerCase();
       if (mode === 'create') {
-        await createUser(name, password, email.trim());
+        const fn = firstName.trim();
+        const ln = lastName.trim();
+        if (!fn || !ln) throw new Error(JSON.stringify({ error: 'First and last name are required' }));
+        await createUser(name, password, email.trim(), fn, ln);
         setError('');
         setMode('login');
         setPassword('');
         setEmail('');
+        setFirstName('');
+        setLastName('');
       } else {
         const user = await findUser(name, password);
         if (!user) throw new Error('User not found or invalid password');
-        onLogin(user.username);
+        onLogin(user);
       }
     } catch (err) {
       try {
@@ -55,6 +62,26 @@ export default function Auth({ onLogin }) {
             required
             autoComplete="username"
           />
+          {mode === 'create' && (
+            <>
+              <input
+                type="text"
+                placeholder="First name"
+                value={firstName}
+                onChange={(e) => setFirstName(e.target.value)}
+                required
+                autoComplete="given-name"
+              />
+              <input
+                type="text"
+                placeholder="Last name"
+                value={lastName}
+                onChange={(e) => setLastName(e.target.value)}
+                required
+                autoComplete="family-name"
+              />
+            </>
+          )}
           {mode === 'create' && (
             <input
               type="email"

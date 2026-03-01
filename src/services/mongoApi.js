@@ -10,12 +10,18 @@ const api = async (path, options = {}) => {
   return text ? JSON.parse(text) : {};
 };
 
+export const getYouTubeStreamUrl = (jobId) => {
+  // EventSource requires an absolute URL in some production setups.
+  // If API is empty, use relative URL (dev proxy).
+  return `${API}/api/youtube/jobs/${encodeURIComponent(jobId)}/stream`;
+};
+
 // ── Users ────────────────────────────────────────────────────────────────────
 
-export const createUser = async (username, password, email = '') => {
+export const createUser = async (username, password, email = '', firstName, lastName) => {
   await api('/api/users', {
     method: 'POST',
-    body: JSON.stringify({ username, password, email }),
+    body: JSON.stringify({ username, password, email, firstName, lastName }),
   });
 };
 
@@ -24,7 +30,10 @@ export const findUser = async (username, password) => {
     method: 'POST',
     body: JSON.stringify({ username, password }),
   });
-  return data.ok ? { username: data.username } : null;
+  if (!data.ok) return null;
+  if (data.user && typeof data.user === 'object') return data.user;
+  // Backward compatible with older backend responses.
+  return data.username ? { username: data.username, firstName: '', lastName: '' } : null;
 };
 
 // ── Sessions ─────────────────────────────────────────────────────────────────
@@ -62,4 +71,17 @@ export const saveMessage = async (sessionId, role, content, imageData = null, ch
 
 export const loadMessages = async (sessionId) => {
   return api(`/api/messages?session_id=${encodeURIComponent(sessionId)}`);
+};
+
+// ── YouTube ──────────────────────────────────────────────────────────────────
+
+export const createYouTubeJob = async (channelUrl, maxVideos) => {
+  return api('/api/youtube/jobs', {
+    method: 'POST',
+    body: JSON.stringify({ channelUrl, maxVideos }),
+  });
+};
+
+export const getYouTubeJobResult = async (jobId) => {
+  return api(`/api/youtube/jobs/${encodeURIComponent(jobId)}/result`);
 };

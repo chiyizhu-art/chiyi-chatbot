@@ -3,7 +3,9 @@ import { CSV_TOOL_DECLARATIONS } from './csvTools';
 
 const genAI = new GoogleGenerativeAI(process.env.REACT_APP_GEMINI_API_KEY || '');
 
-const MODEL = 'gemini-2.0-flash';
+// NOTE: `gemini-2.0-flash` is no longer available to new users (404 from API).
+// Use a currently supported Flash model instead.
+const MODEL = 'gemini-2.5-flash';
 
 const SEARCH_TOOL = { googleSearch: {} };
 const CODE_EXEC_TOOL = { codeExecution: {} };
@@ -23,6 +25,20 @@ async function loadSystemPrompt() {
   return cachedPrompt;
 }
 
+function buildPersonalizationInstruction(user) {
+  if (!user || typeof user !== 'object') return '';
+  const username = typeof user.username === 'string' ? user.username : '';
+  const firstName = typeof user.firstName === 'string' ? user.firstName : '';
+  const lastName = typeof user.lastName === 'string' ? user.lastName : '';
+
+  const displayFirst = (firstName || username || 'there').trim();
+  const fullName = `${firstName || ''} ${lastName || ''}`.trim();
+
+  return `CHAT PERSONALIZATION (required):
+- The user is ${fullName ? fullName : username ? username : 'unknown'}.
+- In the first assistant message of a NEW chat (no prior assistant messages), greet the user by FIRST NAME: "${displayFirst}".`;
+}
+
 // Yields:
 //   { type: 'text', text }           — streaming text chunks
 //   { type: 'fullResponse', parts }  — when code was executed; replaces streamed text
@@ -33,12 +49,15 @@ async function loadSystemPrompt() {
 // useCodeExecution: pass true to use codeExecution tool (CSV/analysis),
 //                   false (default) to use googleSearch tool.
 // Note: Gemini does not support both tools simultaneously.
-export const streamChat = async function* (history, newMessage, imageParts = [], useCodeExecution = false) {
+export const streamChat = async function* (history, newMessage, imageParts = [], useCodeExecution = false, user = null) {
   const systemInstruction = await loadSystemPrompt();
+  const personalization = buildPersonalizationInstruction(user);
   const tools = useCodeExecution ? [CODE_EXEC_TOOL] : [SEARCH_TOOL];
+  const combinedInstruction = [systemInstruction, personalization].filter(Boolean).join('\n\n');
   const model = genAI.getGenerativeModel({
     model: MODEL,
     tools,
+    ...(combinedInstruction ? { systemInstruction: combinedInstruction } : {}),
   });
 
   const baseHistory = history.map((m) => ({
@@ -46,18 +65,7 @@ export const streamChat = async function* (history, newMessage, imageParts = [],
     parts: [{ text: m.content || '' }],
   }));
 
-  const chatHistory = systemInstruction
-    ? [
-        {
-          role: 'user',
-          parts: [{ text: `Follow these instructions in every response:\n\n${systemInstruction}` }],
-        },
-        { role: 'model', parts: [{ text: "Got it! I'll follow those instructions." }] },
-        ...baseHistory,
-      ]
-    : baseHistory;
-
-  const chat = model.startChat({ history: chatHistory });
+  const chat = model.startChat({ history: baseHistory });
 
   const parts = [
     { text: newMessage },
@@ -128,11 +136,16 @@ export const streamChat = async function* (history, newMessage, imageParts = [],
 // executeFn(toolName, args) → plain JS object with the result
 // Returns the final text response from the model.
 
-export const chatWithCsvTools = async (history, newMessage, csvHeaders, executeFn) => {
+export const chatWithCsvTools = async (history, newMessage, csvHeaders, executeFn, user = null) => {
   const systemInstruction = await loadSystemPrompt();
+  // Note: this path is used only when the CSV JS tools handle the request.
+  // Keep the same personalization behavior as the streaming path.
+  const personalization = buildPersonalizationInstruction(user);
+  const combinedInstruction = [systemInstruction, personalization].filter(Boolean).join('\n\n');
   const model = genAI.getGenerativeModel({
     model: MODEL,
     tools: [{ functionDeclarations: CSV_TOOL_DECLARATIONS }],
+    ...(combinedInstruction ? { systemInstruction: combinedInstruction } : {}),
   });
 
   const baseHistory = history.map((m) => ({
@@ -140,18 +153,7 @@ export const chatWithCsvTools = async (history, newMessage, csvHeaders, executeF
     parts: [{ text: m.content || '' }],
   }));
 
-  const chatHistory = systemInstruction
-    ? [
-        {
-          role: 'user',
-          parts: [{ text: `Follow these instructions in every response:\n\n${systemInstruction}` }],
-        },
-        { role: 'model', parts: [{ text: "Got it! I'll follow those instructions." }] },
-        ...baseHistory,
-      ]
-    : baseHistory;
-
-  const chat = model.startChat({ history: chatHistory });
+  const chat = model.startChat({ history: baseHistory });
 
   // Include column names so the model can match user intent to exact column names
   const msgWithContext = csvHeaders?.length

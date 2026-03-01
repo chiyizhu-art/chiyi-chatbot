@@ -11,6 +11,7 @@ import {
   loadMessages,
 } from '../services/mongoApi';
 import EngagementChart from './EngagementChart';
+import YouTubeDownload from './YouTubeDownload';
 import './Chat.css';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -110,7 +111,9 @@ function StructuredParts({ parts }) {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-export default function Chat({ username, onLogout }) {
+export default function Chat({ user, onLogout }) {
+  const username = user?.username || '';
+  const [activePage, setActivePage] = useState('chat'); // 'chat' | 'youtube'
   const [sessions, setSessions] = useState([]);
   const [activeSessionId, setActiveSessionId] = useState(null);
   const [messages, setMessages] = useState([]);
@@ -132,6 +135,7 @@ export default function Chat({ username, onLogout }) {
   // Set to true immediately before setActiveSessionId() is called during a send
   // so the messages useEffect knows to skip the reload (streaming is in progress).
   const justCreatedSessionRef = useRef(false);
+  const greetingStartedRef = useRef(false);
 
   // On login: load sessions from DB; 'new' means an unsaved pending chat
   useEffect(() => {
@@ -142,6 +146,79 @@ export default function Chat({ username, onLogout }) {
     };
     init();
   }, [username]);
+
+  // On a brand-new chat: create the session and have the AI send the first greeting.
+  // This ensures the first assistant message is AI-generated (not hardcoded UI text).
+  useEffect(() => {
+    if (!username) return;
+    if (activePage !== 'chat') return;
+    if (activeSessionId !== 'new') return;
+    if (messages.length) return;
+    if (streaming) return;
+    if (greetingStartedRef.current) return;
+
+    greetingStartedRef.current = true;
+    setStreaming(true);
+
+    const run = async () => {
+      const title = chatTitle();
+      const { id } = await createSession(username, 'lisa', title);
+      const sessionId = id;
+
+      justCreatedSessionRef.current = true; // skip reload; we'll stream into state
+      setActiveSessionId(sessionId);
+      setSessions((prev) => [
+        { id: sessionId, agent: 'lisa', title, createdAt: new Date().toISOString(), messageCount: 0 },
+        ...prev,
+      ]);
+
+      const assistantId = `a-${Date.now()}`;
+      setMessages([
+        { id: assistantId, role: 'model', content: '', timestamp: new Date().toISOString() },
+      ]);
+      abortRef.current = false;
+
+      let fullContent = '';
+      let structuredParts = null;
+      try {
+        for await (const chunk of streamChat([], 'Start this new chat with a friendly greeting.', [], false, user)) {
+          if (abortRef.current) break;
+          if (chunk.type === 'text') {
+            fullContent += chunk.text;
+            setMessages((m) =>
+              m.map((msg) => (msg.id === assistantId ? { ...msg, content: fullContent } : msg))
+            );
+          } else if (chunk.type === 'fullResponse') {
+            structuredParts = chunk.parts;
+            setMessages((m) =>
+              m.map((msg) =>
+                msg.id === assistantId ? { ...msg, content: '', parts: structuredParts } : msg
+              )
+            );
+          }
+        }
+      } catch (err) {
+        fullContent = `Error: ${err.message}`;
+        setMessages((m) => m.map((msg) => (msg.id === assistantId ? { ...msg, content: fullContent } : msg)));
+      }
+
+      const savedContent = structuredParts
+        ? structuredParts.filter((p) => p.type === 'text').map((p) => p.text).join('\n')
+        : fullContent;
+      await saveMessage(sessionId, 'model', savedContent);
+
+      setSessions((prev) =>
+        prev.map((s) => (s.id === sessionId ? { ...s, messageCount: (s.messageCount || 0) + 1 } : s))
+      );
+
+      setStreaming(false);
+    };
+
+    run().catch((err) => {
+      console.error('[New chat greeting failed]', err);
+      setStreaming(false);
+    });
+  }, [activePage, activeSessionId, messages.length, streaming, username, user]);
 
   useEffect(() => {
     if (!activeSessionId || activeSessionId === 'new') {
@@ -172,6 +249,7 @@ export default function Chat({ username, onLogout }) {
   // ── Session management ──────────────────────────────────────────────────────
 
   const handleNewChat = () => {
+    greetingStartedRef.current = false;
     setActiveSessionId('new');
     setMessages([]);
     setInput('');
@@ -183,6 +261,7 @@ export default function Chat({ username, onLogout }) {
 
   const handleSelectSession = (sessionId) => {
     if (sessionId === activeSessionId) return;
+    greetingStartedRef.current = false;
     setActiveSessionId(sessionId);
     setInput('');
     setImages([]);
@@ -439,7 +518,8 @@ ${sessionSummary}${slimCsvBlock}
           history,
           promptForGemini,
           sessionCsvHeaders,
-          (toolName, args) => executeTool(toolName, args, sessionCsvRows)
+          (toolName, args) => executeTool(toolName, args, sessionCsvRows),
+          user
         );
         fullContent = answer;
         toolCharts = returnedCharts || [];
@@ -460,7 +540,7 @@ ${sessionSummary}${slimCsvBlock}
         );
       } else {
         // ── Streaming path: code execution or search ─────────────────────────
-        for await (const chunk of streamChat(history, promptForGemini, imageParts, useCodeExecution)) {
+        for await (const chunk of streamChat(history, promptForGemini, imageParts, useCodeExecution, user)) {
           if (abortRef.current) break;
           if (chunk.type === 'text') {
             fullContent += chunk.text;
@@ -535,44 +615,62 @@ ${sessionSummary}${slimCsvBlock}
       <aside className="chat-sidebar">
         <div className="sidebar-top">
           <h1 className="sidebar-title">Chat</h1>
-          <button className="new-chat-btn" onClick={handleNewChat}>
-            + New Chat
-          </button>
+          <div className="sidebar-tabs">
+            <button
+              className={`sidebar-tab${activePage === 'chat' ? ' active' : ''}`}
+              onClick={() => setActivePage('chat')}
+            >
+              Chat
+            </button>
+            <button
+              className={`sidebar-tab${activePage === 'youtube' ? ' active' : ''}`}
+              onClick={() => setActivePage('youtube')}
+            >
+              YouTube Channel Download
+            </button>
+          </div>
+          {activePage === 'chat' && (
+            <button className="new-chat-btn" onClick={handleNewChat}>
+              + New Chat
+            </button>
+          )}
         </div>
 
-        <div className="sidebar-sessions">
-          {sessions.map((session) => (
-            <div
-              key={session.id}
-              className={`sidebar-session${session.id === activeSessionId ? ' active' : ''}`}
-              onClick={() => handleSelectSession(session.id)}
-            >
-              <div className="sidebar-session-info">
-                <span className="sidebar-session-title">{session.title}</span>
-                <span className="sidebar-session-date">{formatDate(session.createdAt)}</span>
-              </div>
+        {activePage === 'chat' && (
+          <div className="sidebar-sessions">
+            {sessions.map((session) => (
               <div
-                className="sidebar-session-menu"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setOpenMenuId(openMenuId === session.id ? null : session.id);
-                }}
+                key={session.id}
+                className={`sidebar-session${session.id === activeSessionId ? ' active' : ''}`}
+                onClick={() => handleSelectSession(session.id)}
               >
-                <span className="three-dots">⋮</span>
-                {openMenuId === session.id && (
-                  <div className="session-dropdown">
-                    <button
-                      className="session-delete-btn"
-                      onClick={(e) => handleDeleteSession(session.id, e)}
-                    >
-                      Delete
-                    </button>
-                  </div>
-                )}
+                <div className="sidebar-session-info">
+                  <span className="sidebar-session-title">{session.title}</span>
+                  <span className="sidebar-session-date">{formatDate(session.createdAt)}</span>
+                </div>
+                <div
+                  className="sidebar-session-menu"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setOpenMenuId(openMenuId === session.id ? null : session.id);
+                  }}
+                >
+                  <span className="three-dots">⋮</span>
+                  {openMenuId === session.id && (
+                    <div className="session-dropdown">
+                      <button
+                        className="session-delete-btn"
+                        onClick={(e) => handleDeleteSession(session.id, e)}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  )}
+                </div>
               </div>
-            </div>
-          ))}
-        </div>
+            ))}
+          </div>
+        )}
 
         <div className="sidebar-footer">
           <span className="sidebar-username">{username}</span>
@@ -584,25 +682,31 @@ ${sessionSummary}${slimCsvBlock}
 
       {/* ── Main chat area ───────────────────────── */}
       <div className="chat-main">
-        <>
-        <header className="chat-header">
-          <h2 className="chat-header-title">{activeSession?.title ?? 'New Chat'}</h2>
-        </header>
+        {activePage === 'youtube' ? (
+          <YouTubeDownload user={user} />
+        ) : (
+          <>
+            <header className="chat-header">
+              <h2 className="chat-header-title">{activeSession?.title ?? 'New Chat'}</h2>
+            </header>
 
-        <div
-          className={`chat-messages${dragOver ? ' drag-over' : ''}`}
-          onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
-          onDragLeave={() => setDragOver(false)}
-          onDrop={handleDrop}
-        >
-          {messages.map((m) => (
-            <div key={m.id} className={`chat-msg ${m.role}`}>
-              <div className="chat-msg-meta">
-                <span className="chat-msg-role">{m.role === 'user' ? username : 'Lisa'}</span>
-                <span className="chat-msg-time">
-                  {new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                </span>
-              </div>
+            <div
+              className={`chat-messages${dragOver ? ' drag-over' : ''}`}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragOver(true);
+              }}
+              onDragLeave={() => setDragOver(false)}
+              onDrop={handleDrop}
+            >
+              {messages.map((m) => (
+                <div key={m.id} className={`chat-msg ${m.role}`}>
+                  <div className="chat-msg-meta">
+                    <span className="chat-msg-role">{m.role === 'user' ? username : 'Lisa'}</span>
+                    <span className="chat-msg-time">
+                      {new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                    </span>
+                  </div>
 
               {/* CSV badge on user messages */}
               {m.csvName && (
@@ -694,84 +798,90 @@ ${sessionSummary}${slimCsvBlock}
                   )}
                 </div>
               )}
-            </div>
-          ))}
-          <div ref={bottomRef} />
-        </div>
-
-        {dragOver && <div className="chat-drop-overlay">Drop CSV or images here</div>}
-
-        {/* ── Input area ── */}
-        <div className="chat-input-area">
-          {/* CSV chip */}
-          {csvContext && (
-            <div className="csv-chip">
-              <span className="csv-chip-icon">📄</span>
-              <span className="csv-chip-name">{csvContext.name}</span>
-              <span className="csv-chip-meta">
-                {csvContext.rowCount} rows · {csvContext.headers.length} cols
-              </span>
-              <button className="csv-chip-remove" onClick={() => setCsvContext(null)} aria-label="Remove CSV">×</button>
-            </div>
-          )}
-
-          {/* Image previews */}
-          {images.length > 0 && (
-            <div className="chat-image-previews">
-              {images.map((img, i) => (
-                <div key={i} className="chat-img-preview">
-                  <img src={`data:${img.mimeType};base64,${img.data}`} alt="" />
-                  <button type="button" onClick={() => removeImage(i)} aria-label="Remove">×</button>
                 </div>
               ))}
+              <div ref={bottomRef} />
             </div>
-          )}
 
-          {/* Hidden file picker */}
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/*,.csv,text/csv"
-            multiple
-            style={{ display: 'none' }}
-            onChange={handleFileSelect}
-          />
+            {dragOver && <div className="chat-drop-overlay">Drop CSV or images here</div>}
 
-          <div className="chat-input-row">
-            <button
-              type="button"
-              className="attach-btn"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={streaming}
-              title="Attach image or CSV"
-            >
-              📎
-            </button>
-            <input
-              ref={inputRef}
-              type="text"
-              placeholder="Ask a question, request analysis, or write & run code…"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSend()}
-              onPaste={handlePaste}
-              disabled={streaming}
-            />
-            {streaming ? (
-              <button onClick={handleStop} className="stop-btn">
-                ■ Stop
-              </button>
-            ) : (
-              <button
-                onClick={handleSend}
-                disabled={!input.trim() && !images.length && !csvContext}
-              >
-                Send
-              </button>
-            )}
-          </div>
-        </div>
-        </>
+            {/* ── Input area ── */}
+            <div className="chat-input-area">
+              {/* CSV chip */}
+              {csvContext && (
+                <div className="csv-chip">
+                  <span className="csv-chip-icon">📄</span>
+                  <span className="csv-chip-name">{csvContext.name}</span>
+                  <span className="csv-chip-meta">
+                    {csvContext.rowCount} rows · {csvContext.headers.length} cols
+                  </span>
+                  <button
+                    className="csv-chip-remove"
+                    onClick={() => setCsvContext(null)}
+                    aria-label="Remove CSV"
+                  >
+                    ×
+                  </button>
+                </div>
+              )}
+
+              {/* Image previews */}
+              {images.length > 0 && (
+                <div className="chat-image-previews">
+                  {images.map((img, i) => (
+                    <div key={i} className="chat-img-preview">
+                      <img src={`data:${img.mimeType};base64,${img.data}`} alt="" />
+                      <button type="button" onClick={() => removeImage(i)} aria-label="Remove">
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Hidden file picker */}
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*,.csv,text/csv"
+                multiple
+                style={{ display: 'none' }}
+                onChange={handleFileSelect}
+              />
+
+              <div className="chat-input-row">
+                <button
+                  type="button"
+                  className="attach-btn"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={streaming}
+                  title="Attach image or CSV"
+                >
+                  📎
+                </button>
+                <input
+                  ref={inputRef}
+                  type="text"
+                  placeholder="Ask a question, request analysis, or write & run code…"
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSend()}
+                  onPaste={handlePaste}
+                  disabled={streaming}
+                />
+                {streaming ? (
+                  <button onClick={handleStop} className="stop-btn">
+                    ■ Stop
+                  </button>
+                ) : (
+                  <button onClick={handleSend} disabled={!input.trim() && !images.length && !csvContext}>
+                    Send
+                  </button>
+                )}
+              </div>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );
