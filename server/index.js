@@ -9,6 +9,82 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+// ── Retry/backoff for Google API calls ────────────────────────────────────────
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const parseDurationToMs = (dur) => {
+  // Accepts "1s", "2.5s", or { seconds, nanos }.
+  if (!dur) return null;
+  if (typeof dur === 'string') {
+    const m = dur.trim().match(/^(\d+(?:\.\d+)?)s$/i);
+    if (!m) return null;
+    const s = Number(m[1]);
+    return Number.isFinite(s) ? Math.max(0, Math.round(s * 1000)) : null;
+  }
+  if (typeof dur === 'object') {
+    const seconds = Number(dur.seconds || 0);
+    const nanos = Number(dur.nanos || 0);
+    if (!Number.isFinite(seconds) || !Number.isFinite(nanos)) return null;
+    return Math.max(0, Math.round(seconds * 1000 + nanos / 1e6));
+  }
+  return null;
+};
+
+const getRetryDelayMs = (resp, json, fallbackMs) => {
+  // Prefer explicit server hints if available.
+  const retryAfter = resp?.headers?.get?.('retry-after');
+  if (retryAfter) {
+    const s = Number(retryAfter);
+    if (Number.isFinite(s)) return Math.max(0, Math.round(s * 1000));
+  }
+
+  // Google RPC RetryInfo (best-effort).
+  const details = json?.error?.details;
+  if (Array.isArray(details)) {
+    const retryInfo = details.find((d) =>
+      typeof d?.['@type'] === 'string' && d['@type'].includes('google.rpc.RetryInfo')
+    );
+    const ms = parseDurationToMs(retryInfo?.retryDelay);
+    if (typeof ms === 'number') return ms;
+  }
+
+  return fallbackMs;
+};
+
+async function fetchWithRetry(url, options, { maxRetries = 3, baseDelayMs = 1000 } = {}) {
+  let lastJson = null;
+  let lastStatus = null;
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const resp = await fetch(url, options);
+    lastStatus = resp.status;
+
+    let json = {};
+    try {
+      json = await resp.json();
+    } catch {
+      json = {};
+    }
+    lastJson = json;
+
+    if (resp.ok) return { ok: true, status: resp.status, json };
+
+    const isRateLimit = resp.status === 429;
+    if (!isRateLimit) return { ok: false, status: resp.status, json };
+
+    const fallback = baseDelayMs * 2 ** attempt; // 1s, 2s, 4s
+    const delayMs = getRetryDelayMs(resp, json, fallback);
+    console.error(`[Gemini] 429 rate limit. Retry ${attempt + 1}/${maxRetries} after ${delayMs}ms`, {
+      status: resp.status,
+      error: json?.error?.message,
+    });
+    await sleep(delayMs);
+  }
+
+  return { ok: false, status: lastStatus || 429, json: lastJson || {} };
+}
+
 const URI = process.env.REACT_APP_MONGODB_URI || process.env.MONGODB_URI || process.env.REACT_APP_MONGO_URI;
 const DB = 'chatapp';
 
@@ -41,6 +117,67 @@ app.get('/api/status', async (req, res) => {
     res.json({ usersCount, sessionsCount });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Image generation (Google Gemini image model) ──────────────────────────────
+
+app.post('/api/images/generate', async (req, res) => {
+  try {
+    const { prompt, anchorImageBase64 } = req.body || {};
+    const text = typeof prompt === 'string' ? prompt.trim() : '';
+    if (!text) return res.status(400).json({ error: 'prompt is required' });
+
+    // Prefer server-side secret name, but keep backward compatibility with existing .env usage.
+    const apiKey =
+      process.env.GEMINI_API_KEY ||
+      process.env.GOOGLE_API_KEY ||
+      process.env.REACT_APP_GEMINI_API_KEY ||
+      '';
+    if (!apiKey) return res.status(500).json({ error: 'Missing Gemini API key on server' });
+
+    const parts = [{ text }];
+    if (typeof anchorImageBase64 === 'string' && anchorImageBase64.trim()) {
+      // Best-effort: treat as PNG if mime type is unknown.
+      parts.push({ inlineData: { mimeType: 'image/png', data: anchorImageBase64.trim() } });
+    }
+
+    const IMAGE_MODEL = 'gemini-2.5-flash-image';
+    const IMAGE_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${IMAGE_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+    const result = await fetchWithRetry(
+      IMAGE_ENDPOINT,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts }],
+        }),
+      },
+      { maxRetries: 3, baseDelayMs: 1000 }
+    );
+
+    if (!result.ok) {
+      const msg =
+        result.status === 429
+          ? 'Rate limit hit, please retry in ~60 seconds.'
+          : result.json?.error?.message || 'Image generation failed';
+      console.error('[generateImage] Gemini image API error:', { model: IMAGE_MODEL, status: result.status, error: result.json });
+      return res.status(result.status || 500).json({ error: msg });
+    }
+
+    const outParts = result.json?.candidates?.[0]?.content?.parts || [];
+    const imgPart = outParts.find((p) => p.inlineData?.data && p.inlineData?.mimeType?.startsWith('image/'));
+    if (!imgPart) {
+      console.error('[generateImage] No image in response:', { model: IMAGE_MODEL, response: result.json });
+      return res.status(500).json({ error: 'No image returned by model' });
+    }
+
+    // Preferred output shape for HW5
+    res.json({ imageBase64: imgPart.inlineData.data });
+  } catch (err) {
+    console.error('[generateImage] Unexpected error:', err);
+    res.status(500).json({ error: err?.message || 'Unexpected error' });
   }
 });
 

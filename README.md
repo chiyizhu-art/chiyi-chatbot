@@ -24,7 +24,7 @@ The backend also accepts `MONGODB_URI` or `REACT_APP_MONGO_URI` as the MongoDB c
 ### Example `.env` (local development)
 
 ```
-REACT_APP_GEMINI_API_KEY=AIzaSy...
+REACT_APP_GEMINI_API_KEY=YOUR_GEMINI_API_KEY_HERE
 REACT_APP_MONGODB_URI=mongodb+srv://user:password@cluster.mongodb.net/
 # REACT_APP_API_URL not needed locally — the dev server proxies /api to localhost:3001
 ```

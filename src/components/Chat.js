@@ -86,6 +86,7 @@ const svgElementToPngDataUrl = async (svgEl, scale = 2) => {
   const svgBlob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
   const url = URL.createObjectURL(svgBlob);
   try {
+    const rect = svgEl.getBoundingClientRect?.();
     const img = new Image();
     img.crossOrigin = 'anonymous';
     await new Promise((resolve, reject) => {
@@ -94,8 +95,10 @@ const svgElementToPngDataUrl = async (svgEl, scale = 2) => {
       img.src = url;
     });
     const canvas = document.createElement('canvas');
-    canvas.width = Math.max(1, Math.floor(img.width * scale));
-    canvas.height = Math.max(1, Math.floor(img.height * scale));
+    const w = rect?.width || img.width || 800;
+    const h = rect?.height || img.height || 420;
+    canvas.width = Math.max(1, Math.floor(w * scale));
+    canvas.height = Math.max(1, Math.floor(h * scale));
     const ctx = canvas.getContext('2d');
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
     return canvas.toDataURL('image/png');
@@ -190,6 +193,7 @@ export default function Chat({ user, onLogout }) {
   // so the messages useEffect knows to skip the reload (streaming is in progress).
   const justCreatedSessionRef = useRef(false);
   const greetingStartedRef = useRef(false);
+  const channelJsonInjectedRef = useRef(new Set()); // sessionId -> injected full JSON at least once
 
   const buildChannelContextInstruction = (data) => {
     if (!Array.isArray(data) || data.length === 0) return '';
@@ -197,10 +201,13 @@ export default function Chat({ user, onLogout }) {
 The JSON is an array of ${data.length} video objects with fields such as:
 title, description, transcript, duration_seconds, release_date, view_count, like_count, comment_count, video_url, thumbnail_url.
 
-Use this data to answer questions about the channel and its videos.
+Use this data to answer questions about the channel and its videos. Prefer calling tools for any stats/plots/video selection.`;
+  };
 
-Here is the channel JSON data:
-${JSON.stringify(data)}`;
+  const buildChannelJsonBlock = (data) => {
+    if (!Array.isArray(data) || data.length === 0) return '';
+    // Full JSON is large; inject it once per session for token safety.
+    return `Channel data JSON follows:\n${JSON.stringify(data)}`;
   };
 
   // On login: load sessions from DB; 'new' means an unsaved pending chat
@@ -237,7 +244,27 @@ ${JSON.stringify(data)}`;
     }
   };
 
-  const executeRequiredTool = async (toolName, args, capturedImagesForAnchor = []) => {
+  const sanitizeImagePrompt = (raw) => {
+    const s = String(raw || '').trim();
+    if (!s) return '';
+    // Strip any accidental injected context (system prompt, JSON blocks, history).
+    const cutMarkers = [
+      'Channel data JSON follows:',
+      'Here is the channel JSON data:',
+      'Follow these instructions in every response:',
+      'CHAT PERSONALIZATION (required):',
+    ];
+    let out = s;
+    for (const m of cutMarkers) {
+      const idx = out.indexOf(m);
+      if (idx !== -1) out = out.slice(0, idx).trim();
+    }
+    // Hard cap to avoid token blowups.
+    if (out.length > 600) out = out.slice(0, 600).trim();
+    return out;
+  };
+
+  const executeRequiredTool = async (toolName, args, capturedImagesForAnchor = [], userText = '') => {
     const supportedMetrics = ['view_count', 'like_count', 'comment_count', 'duration_seconds'];
     const safeMetric = (m) => (supportedMetrics.includes(m) ? m : null);
 
@@ -311,8 +338,19 @@ ${JSON.stringify(data)}`;
         const sorted = vids
           .filter((v) => typeof v.release_date === 'string')
           .sort((a, b) => String(a.release_date).localeCompare(String(b.release_date)));
-        const idx = Math.max(0, Number(value) - 1);
-        picked = sorted[idx] || null;
+        const n = Number(value);
+        if (!Number.isFinite(n) || n % 1 !== 0) {
+          return { title: null, thumbnail_url: null, video_url: null, error: 'Ordinal must be an integer (1-based).' };
+        }
+        if (n < 1 || n > sorted.length) {
+          return {
+            title: null,
+            thumbnail_url: null,
+            video_url: null,
+            error: `Ordinal out of range. Please choose 1–${sorted.length}.`,
+          };
+        }
+        picked = sorted[n - 1] || null;
       } else if (st === 'title') {
         const q = String(value || '').trim().toLowerCase();
         if (!q) return { title: null, thumbnail_url: null, video_url: null, error: 'Missing title value' };
@@ -343,47 +381,38 @@ ${JSON.stringify(data)}`;
     }
 
     if (toolName === 'generateImage') {
-      const prompt = String(args?.prompt || '').trim();
-      if (!prompt) return { base64_image: null, mimeType: null, error: 'Missing prompt' };
+      // IMPORTANT: keep the image model request minimal:
+      // only the user's image prompt, no system prompt, no channel JSON, no history.
+      const promptFromUser = sanitizeImagePrompt(userText);
+      const promptFromToolArgs = sanitizeImagePrompt(args?.prompt);
+      const prompt = promptFromUser || promptFromToolArgs;
+      if (!prompt) return { imageBase64: '', error: 'Missing prompt' };
 
-      const anchor =
+      const explicitAnchor =
         typeof args?.anchorImageBase64 === 'string' && args.anchorImageBase64.trim()
           ? args.anchorImageBase64.trim()
-          : capturedImagesForAnchor?.[0]?.data || null;
+          : null;
+      const fallbackAnchor = capturedImagesForAnchor?.[0]?.data || null;
+      const anchor = explicitAnchor || fallbackAnchor;
 
-      const apiKey = process.env.REACT_APP_GEMINI_API_KEY || '';
-      if (!apiKey) return { base64_image: null, mimeType: null, error: 'Missing REACT_APP_GEMINI_API_KEY' };
+      const resp = await fetch('/api/images/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt,
+          ...(anchor ? { anchorImageBase64: anchor } : {}),
+        }),
+      });
 
-      const body = {
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              { text: prompt },
-              ...(anchor ? [{ inlineData: { mimeType: 'image/png', data: anchor } }] : []),
-            ],
-          },
-        ],
-      };
-
-      const resp = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${encodeURIComponent(apiKey)}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        }
-      );
-      const json = await resp.json();
+      const json = await resp.json().catch(() => ({}));
       if (!resp.ok) {
-        return { base64_image: null, mimeType: null, error: json?.error?.message || 'Image generation failed' };
+        console.error('[generateImage] backend error:', json);
+        return { imageBase64: '', error: json?.error || 'Image generation failed' };
       }
+      if (!json?.imageBase64) return { imageBase64: '', error: 'No image returned' };
 
-      const parts = json?.candidates?.[0]?.content?.parts || [];
-      const imgPart = parts.find((p) => p.inlineData?.data && p.inlineData?.mimeType?.startsWith('image/'));
-      if (!imgPart) return { base64_image: null, mimeType: null, error: 'No image returned' };
-
-      return { base64_image: imgPart.inlineData.data, mimeType: imgPart.inlineData.mimeType };
+      // Backward compatible with existing renderer expectations:
+      return { imageBase64: json.imageBase64, base64_image: json.imageBase64, mimeType: 'image/png' };
     }
 
     return { error: `Unknown tool: ${toolName}` };
@@ -428,14 +457,16 @@ ${JSON.stringify(data)}`;
           if (abortRef.current) break;
           if (chunk.type === 'text') {
             fullContent += chunk.text;
+            const contentSnapshot = fullContent;
             setMessages((m) =>
-              m.map((msg) => (msg.id === assistantId ? { ...msg, content: fullContent } : msg))
+              m.map((msg) => (msg.id === assistantId ? { ...msg, content: contentSnapshot } : msg))
             );
           } else if (chunk.type === 'fullResponse') {
             structuredParts = chunk.parts;
+            const partsSnapshot = structuredParts;
             setMessages((m) =>
               m.map((msg) =>
-                msg.id === assistantId ? { ...msg, content: '', parts: structuredParts } : msg
+                msg.id === assistantId ? { ...msg, content: '', parts: partsSnapshot } : msg
               )
             );
           }
@@ -461,7 +492,7 @@ ${JSON.stringify(data)}`;
       console.error('[New chat greeting failed]', err);
       setStreaming(false);
     });
-  }, [activePage, activeSessionId, messages.length, streaming, username, user]);
+  }, [activePage, activeSessionId, channelData, messages.length, streaming, username, user]);
 
   useEffect(() => {
     if (!activeSessionId || activeSessionId === 'new') {
@@ -668,8 +699,6 @@ ${JSON.stringify(data)}`;
     const text = input.trim();
     if ((!text && !images.length && !csvContext) || streaming || !activeSessionId) return;
 
-    const channelContextInstruction = buildChannelContextInstruction(channelData);
-
     // Lazily create the session in DB on the very first message
     let sessionId = activeSessionId;
     if (sessionId === 'new') {
@@ -681,13 +710,19 @@ ${JSON.stringify(data)}`;
       setSessions((prev) => [{ id, agent: 'lisa', title, createdAt: new Date().toISOString(), messageCount: 0 }, ...prev]);
     }
 
+    // Token safety: inject full JSON once per session (but keep a summary instruction always).
+    const channelContextInstruction = buildChannelContextInstruction(channelData);
+    const shouldInjectJson = !!channelData && !channelJsonInjectedRef.current.has(sessionId);
+    const channelJsonBlock = shouldInjectJson ? buildChannelJsonBlock(channelData) : '';
+    const combinedChannelInstruction = [channelContextInstruction, channelJsonBlock].filter(Boolean).join('\n\n');
+    if (shouldInjectJson) channelJsonInjectedRef.current.add(sessionId);
+
     // ── Routing intent (computed first so we know whether Python/base64 is needed) ──
     // PYTHON_ONLY = things the client tools genuinely cannot produce
     const PYTHON_ONLY_KEYWORDS = /\b(regression|scatter|histogram|seaborn|matplotlib|numpy|time.?series|heatmap|box.?plot|violin|distribut|linear.?model|logistic|forecast|trend.?line)\b/i;
     const wantPythonOnly = PYTHON_ONLY_KEYWORDS.test(text);
     const wantCode = CODE_KEYWORDS.test(text) && !sessionCsvRows;
     const capturedCsv = csvContext;
-    const hasCsvInSession = !!sessionCsvRows || !!capturedCsv;
     // Base64 is only worth sending when Gemini will actually run Python
     const needsBase64 = !!capturedCsv && wantPythonOnly;
     // Mode selection:
@@ -797,7 +832,7 @@ ${sessionSummary}${slimCsvBlock}
           sessionCsvHeaders,
           (toolName, args) => executeTool(toolName, args, sessionCsvRows),
           user,
-          channelContextInstruction
+          combinedChannelInstruction
         );
         fullContent = answer;
         toolCharts = returnedCharts || [];
@@ -821,9 +856,9 @@ ${sessionSummary}${slimCsvBlock}
           history,
           promptForGemini,
           REQUIRED_CHAT_TOOL_DECLARATIONS,
-          (toolName, args) => executeRequiredTool(toolName, args, capturedImages),
+          (toolName, args) => executeRequiredTool(toolName, args, capturedImages, text),
           user,
-          channelContextInstruction
+          combinedChannelInstruction
         );
         fullContent = answer;
         toolCalls = returnedCalls || [];
@@ -868,18 +903,20 @@ ${sessionSummary}${slimCsvBlock}
         );
       } else {
         // ── Streaming path: code execution or search ─────────────────────────
-        for await (const chunk of streamChat(history, promptForGemini, imageParts, useCodeExecution, user, channelContextInstruction)) {
+        for await (const chunk of streamChat(history, promptForGemini, imageParts, useCodeExecution, user, combinedChannelInstruction)) {
           if (abortRef.current) break;
           if (chunk.type === 'text') {
             fullContent += chunk.text;
+            const contentSnapshot = fullContent;
             setMessages((m) =>
-              m.map((msg) => (msg.id === assistantId ? { ...msg, content: fullContent } : msg))
+              m.map((msg) => (msg.id === assistantId ? { ...msg, content: contentSnapshot } : msg))
             );
           } else if (chunk.type === 'fullResponse') {
             structuredParts = chunk.parts;
+            const partsSnapshot = structuredParts;
             setMessages((m) =>
               m.map((msg) =>
-                msg.id === assistantId ? { ...msg, content: '', parts: structuredParts } : msg
+                msg.id === assistantId ? { ...msg, content: '', parts: partsSnapshot } : msg
               )
             );
           } else if (chunk.type === 'grounding') {

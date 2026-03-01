@@ -46,6 +46,29 @@ function normalizeExtraSystemInstruction(extraSystemInstruction) {
   return t ? t : '';
 }
 
+function buildPreambleText(systemInstruction, personalization, extra) {
+  const blocks = [systemInstruction, personalization, extra].filter(Boolean);
+  if (!blocks.length) return '';
+  return `Follow these instructions in every response:\n\n${blocks.join('\n\n')}`;
+}
+
+function mapAndFixHistory(history, preambleText) {
+  const mapped = (history || []).map((m) => ({
+    // Gemini expects the conversation to start with role 'user'.
+    role: m.role === 'user' ? 'user' : 'model',
+    parts: [{ text: m.content || '' }],
+  }));
+
+  // If history starts with model (common when the assistant greets first),
+  // drop leading model turns so the first content is always role 'user'.
+  while (mapped.length && mapped[0].role !== 'user') mapped.shift();
+
+  const out = [];
+  if (preambleText) out.push({ role: 'user', parts: [{ text: preambleText }] });
+  out.push(...mapped);
+  return out;
+}
+
 // Yields:
 //   { type: 'text', text }           — streaming text chunks
 //   { type: 'fullResponse', parts }  — when code was executed; replaces streamed text
@@ -61,19 +84,14 @@ export const streamChat = async function* (history, newMessage, imageParts = [],
   const personalization = buildPersonalizationInstruction(user);
   const extra = normalizeExtraSystemInstruction(extraSystemInstruction);
   const tools = useCodeExecution ? [CODE_EXEC_TOOL] : [SEARCH_TOOL];
-  const combinedInstruction = [systemInstruction, personalization, extra].filter(Boolean).join('\n\n');
+  const preambleText = buildPreambleText(systemInstruction, personalization, extra);
   const model = genAI.getGenerativeModel({
     model: MODEL,
     tools,
-    ...(combinedInstruction ? { systemInstruction: combinedInstruction } : {}),
   });
 
-  const baseHistory = history.map((m) => ({
-    role: m.role === 'user' ? 'user' : 'model',
-    parts: [{ text: m.content || '' }],
-  }));
-
-  const chat = model.startChat({ history: baseHistory });
+  const chatHistory = mapAndFixHistory(history, preambleText);
+  const chat = model.startChat({ history: chatHistory });
 
   const parts = [
     { text: newMessage },
@@ -150,19 +168,14 @@ export const chatWithCsvTools = async (history, newMessage, csvHeaders, executeF
   // Keep the same personalization behavior as the streaming path.
   const personalization = buildPersonalizationInstruction(user);
   const extra = normalizeExtraSystemInstruction(extraSystemInstruction);
-  const combinedInstruction = [systemInstruction, personalization, extra].filter(Boolean).join('\n\n');
+  const preambleText = buildPreambleText(systemInstruction, personalization, extra);
   const model = genAI.getGenerativeModel({
     model: MODEL,
     tools: [{ functionDeclarations: CSV_TOOL_DECLARATIONS }],
-    ...(combinedInstruction ? { systemInstruction: combinedInstruction } : {}),
   });
 
-  const baseHistory = history.map((m) => ({
-    role: m.role === 'user' ? 'user' : 'model',
-    parts: [{ text: m.content || '' }],
-  }));
-
-  const chat = model.startChat({ history: baseHistory });
+  const chatHistory = mapAndFixHistory(history, preambleText);
+  const chat = model.startChat({ history: chatHistory });
 
   // Include column names so the model can match user intent to exact column names
   const msgWithContext = csvHeaders?.length
@@ -221,20 +234,15 @@ export const chatWithFunctionTools = async (
   const systemInstruction = await loadSystemPrompt();
   const personalization = buildPersonalizationInstruction(user);
   const extra = normalizeExtraSystemInstruction(extraSystemInstruction);
-  const combinedInstruction = [systemInstruction, personalization, extra].filter(Boolean).join('\n\n');
+  const preambleText = buildPreambleText(systemInstruction, personalization, extra);
 
   const model = genAI.getGenerativeModel({
     model: MODEL,
     tools: [{ functionDeclarations }],
-    ...(combinedInstruction ? { systemInstruction: combinedInstruction } : {}),
   });
 
-  const baseHistory = history.map((m) => ({
-    role: m.role === 'user' ? 'user' : 'model',
-    parts: [{ text: m.content || '' }],
-  }));
-
-  const chat = model.startChat({ history: baseHistory });
+  const chatHistory = mapAndFixHistory(history, preambleText);
+  const chat = model.startChat({ history: chatHistory });
 
   let response = (await chat.sendMessage(newMessage)).response;
   const toolCalls = [];
