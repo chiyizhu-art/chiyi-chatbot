@@ -39,6 +39,13 @@ function buildPersonalizationInstruction(user) {
 - In the first assistant message of a NEW chat (no prior assistant messages), greet the user by FIRST NAME: "${displayFirst}".`;
 }
 
+function normalizeExtraSystemInstruction(extraSystemInstruction) {
+  if (!extraSystemInstruction) return '';
+  if (typeof extraSystemInstruction !== 'string') return '';
+  const t = extraSystemInstruction.trim();
+  return t ? t : '';
+}
+
 // Yields:
 //   { type: 'text', text }           — streaming text chunks
 //   { type: 'fullResponse', parts }  — when code was executed; replaces streamed text
@@ -49,11 +56,12 @@ function buildPersonalizationInstruction(user) {
 // useCodeExecution: pass true to use codeExecution tool (CSV/analysis),
 //                   false (default) to use googleSearch tool.
 // Note: Gemini does not support both tools simultaneously.
-export const streamChat = async function* (history, newMessage, imageParts = [], useCodeExecution = false, user = null) {
+export const streamChat = async function* (history, newMessage, imageParts = [], useCodeExecution = false, user = null, extraSystemInstruction = '') {
   const systemInstruction = await loadSystemPrompt();
   const personalization = buildPersonalizationInstruction(user);
+  const extra = normalizeExtraSystemInstruction(extraSystemInstruction);
   const tools = useCodeExecution ? [CODE_EXEC_TOOL] : [SEARCH_TOOL];
-  const combinedInstruction = [systemInstruction, personalization].filter(Boolean).join('\n\n');
+  const combinedInstruction = [systemInstruction, personalization, extra].filter(Boolean).join('\n\n');
   const model = genAI.getGenerativeModel({
     model: MODEL,
     tools,
@@ -136,12 +144,13 @@ export const streamChat = async function* (history, newMessage, imageParts = [],
 // executeFn(toolName, args) → plain JS object with the result
 // Returns the final text response from the model.
 
-export const chatWithCsvTools = async (history, newMessage, csvHeaders, executeFn, user = null) => {
+export const chatWithCsvTools = async (history, newMessage, csvHeaders, executeFn, user = null, extraSystemInstruction = '') => {
   const systemInstruction = await loadSystemPrompt();
   // Note: this path is used only when the CSV JS tools handle the request.
   // Keep the same personalization behavior as the streaming path.
   const personalization = buildPersonalizationInstruction(user);
-  const combinedInstruction = [systemInstruction, personalization].filter(Boolean).join('\n\n');
+  const extra = normalizeExtraSystemInstruction(extraSystemInstruction);
+  const combinedInstruction = [systemInstruction, personalization, extra].filter(Boolean).join('\n\n');
   const model = genAI.getGenerativeModel({
     model: MODEL,
     tools: [{ functionDeclarations: CSV_TOOL_DECLARATIONS }],
@@ -193,4 +202,59 @@ export const chatWithCsvTools = async (history, newMessage, csvHeaders, executeF
   }
 
   return { text: response.text(), charts, toolCalls };
+};
+
+// ── Generic function-calling chat (required tools) ────────────────────────────
+// Gemini picks a tool + args → executeFn runs it client-side → Gemini receives result.
+//
+// executeFn(toolName, args) → plain JS object result (must be JSON-serializable)
+// Returns: { text, toolCalls }
+
+export const chatWithFunctionTools = async (
+  history,
+  newMessage,
+  functionDeclarations,
+  executeFn,
+  user = null,
+  extraSystemInstruction = ''
+) => {
+  const systemInstruction = await loadSystemPrompt();
+  const personalization = buildPersonalizationInstruction(user);
+  const extra = normalizeExtraSystemInstruction(extraSystemInstruction);
+  const combinedInstruction = [systemInstruction, personalization, extra].filter(Boolean).join('\n\n');
+
+  const model = genAI.getGenerativeModel({
+    model: MODEL,
+    tools: [{ functionDeclarations }],
+    ...(combinedInstruction ? { systemInstruction: combinedInstruction } : {}),
+  });
+
+  const baseHistory = history.map((m) => ({
+    role: m.role === 'user' ? 'user' : 'model',
+    parts: [{ text: m.content || '' }],
+  }));
+
+  const chat = model.startChat({ history: baseHistory });
+
+  let response = (await chat.sendMessage(newMessage)).response;
+  const toolCalls = [];
+
+  for (let round = 0; round < 8; round++) {
+    const parts = response.candidates?.[0]?.content?.parts || [];
+    const funcCall = parts.find((p) => p.functionCall);
+    if (!funcCall) break;
+
+    const { name, args } = funcCall.functionCall;
+    console.log('[Tool]', name, args);
+    const toolResult = await executeFn(name, args);
+    console.log('[Tool result]', toolResult);
+
+    toolCalls.push({ name, args, result: toolResult });
+
+    response = (
+      await chat.sendMessage([{ functionResponse: { name, response: { result: toolResult } } }])
+    ).response;
+  }
+
+  return { text: response.text(), toolCalls };
 };

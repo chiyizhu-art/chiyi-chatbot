@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { streamChat, chatWithCsvTools, CODE_KEYWORDS } from '../services/gemini';
+import { streamChat, chatWithCsvTools, chatWithFunctionTools, CODE_KEYWORDS } from '../services/gemini';
 import { parseCsvToRows, executeTool, computeDatasetSummary, enrichWithEngagement, buildSlimCsv } from '../services/csvTools';
+import { REQUIRED_CHAT_TOOL_DECLARATIONS } from '../services/requiredChatTools';
 import {
   getSessions,
   createSession,
@@ -12,6 +13,7 @@ import {
 } from '../services/mongoApi';
 import EngagementChart from './EngagementChart';
 import YouTubeDownload from './YouTubeDownload';
+import MetricTimeChart from './MetricTimeChart';
 import './Chat.css';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -51,6 +53,55 @@ const parseCSV = (text) => {
 const messageText = (m) => {
   if (m.parts) return m.parts.filter((p) => p.type === 'text').map((p) => p.text).join('\n');
   return m.content || '';
+};
+
+const isObjectRecord = (x) => x && typeof x === 'object' && !Array.isArray(x);
+
+const parseChannelJson = (text) => {
+  const parsed = JSON.parse(text);
+  if (!Array.isArray(parsed)) {
+    return { ok: false, error: 'That JSON is valid, but it must be an array of video objects.' };
+  }
+  if (!parsed.every(isObjectRecord)) {
+    return { ok: false, error: 'The JSON array must contain objects (one object per video).' };
+  }
+  return { ok: true, data: parsed };
+};
+
+const downloadDataUrl = (dataUrl, filename) => {
+  const a = document.createElement('a');
+  a.href = dataUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+};
+
+const downloadBase64 = (base64, mimeType, filename) => {
+  downloadDataUrl(`data:${mimeType};base64,${base64}`, filename);
+};
+
+const svgElementToPngDataUrl = async (svgEl, scale = 2) => {
+  const svg = new XMLSerializer().serializeToString(svgEl);
+  const svgBlob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
+  const url = URL.createObjectURL(svgBlob);
+  try {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    await new Promise((resolve, reject) => {
+      img.onload = resolve;
+      img.onerror = reject;
+      img.src = url;
+    });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.floor(img.width * scale));
+    canvas.height = Math.max(1, Math.floor(img.height * scale));
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL('image/png');
+  } finally {
+    URL.revokeObjectURL(url);
+  }
 };
 
 // ── Structured part renderer (code execution responses) ───────────────────────
@@ -119,6 +170,8 @@ export default function Chat({ user, onLogout }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [images, setImages] = useState([]);
+  const [channelData, setChannelData] = useState(null); // YouTube channel JSON (array of video objects)
+  const [channelDataError, setChannelDataError] = useState('');
   const [csvContext, setCsvContext] = useState(null);     // pending attachment chip
   const [sessionCsvRows, setSessionCsvRows] = useState(null);    // parsed rows for JS tools
   const [sessionCsvHeaders, setSessionCsvHeaders] = useState(null); // headers for tool routing
@@ -127,6 +180,7 @@ export default function Chat({ user, onLogout }) {
   const [streaming, setStreaming] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [openMenuId, setOpenMenuId] = useState(null);
+  const [modal, setModal] = useState(null); // { type: 'image'|'chart', ...payload }
 
   const bottomRef = useRef(null);
   const inputRef = useRef(null);
@@ -137,6 +191,18 @@ export default function Chat({ user, onLogout }) {
   const justCreatedSessionRef = useRef(false);
   const greetingStartedRef = useRef(false);
 
+  const buildChannelContextInstruction = (data) => {
+    if (!Array.isArray(data) || data.length === 0) return '';
+    return `The user has uploaded YouTube channel data in JSON format.
+The JSON is an array of ${data.length} video objects with fields such as:
+title, description, transcript, duration_seconds, release_date, view_count, like_count, comment_count, video_url, thumbnail_url.
+
+Use this data to answer questions about the channel and its videos.
+
+Here is the channel JSON data:
+${JSON.stringify(data)}`;
+  };
+
   // On login: load sessions from DB; 'new' means an unsaved pending chat
   useEffect(() => {
     const init = async () => {
@@ -146,6 +212,182 @@ export default function Chat({ user, onLogout }) {
     };
     init();
   }, [username]);
+
+  // Load channel JSON from localStorage (best effort)
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem('channelData');
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.every(isObjectRecord)) {
+        setChannelData(parsed);
+      }
+    } catch {
+      // ignore invalid local storage
+    }
+  }, []);
+
+  const clearChannelData = () => {
+    setChannelData(null);
+    setChannelDataError('');
+    try {
+      localStorage.removeItem('channelData');
+    } catch {
+      // ignore
+    }
+  };
+
+  const executeRequiredTool = async (toolName, args, capturedImagesForAnchor = []) => {
+    const supportedMetrics = ['view_count', 'like_count', 'comment_count', 'duration_seconds'];
+    const safeMetric = (m) => (supportedMetrics.includes(m) ? m : null);
+
+    const data = channelData;
+    const requireData = () => {
+      if (!Array.isArray(data) || data.length === 0) {
+        return { ok: false, error: 'No channel data loaded. Drag and drop a channel JSON file first.' };
+      }
+      return null;
+    };
+
+    if (toolName === 'compute_stats_json') {
+      const m = safeMetric(args?.metric);
+      if (!m) return { metric: args?.metric ?? null, mean: null, median: null, std: null, min: null, max: null, error: 'Unsupported metric' };
+      const missing = requireData();
+      if (missing) return { metric: m, mean: null, median: null, std: null, min: null, max: null, error: missing.error };
+
+      const vals = data
+        .map((v) => Number(v?.[m]))
+        .filter((x) => Number.isFinite(x));
+      if (!vals.length) return { metric: m, mean: null, median: null, std: null, min: null, max: null, error: 'No numeric values found for metric' };
+
+      const sorted = [...vals].sort((a, b) => a - b);
+      const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+      const median = sorted.length % 2 ? sorted[(sorted.length - 1) / 2] : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2;
+      const variance = vals.reduce((acc, x) => acc + (x - mean) ** 2, 0) / vals.length;
+      const std = Math.sqrt(variance);
+      const min = sorted[0];
+      const max = sorted[sorted.length - 1];
+
+      return { metric: m, mean, median, std, min, max };
+    }
+
+    if (toolName === 'plot_metric_vs_time') {
+      const m = safeMetric(args?.metric);
+      if (!m) return { labels: [], values: [], metric: args?.metric ?? null, error: 'Unsupported metric' };
+      const missing = requireData();
+      if (missing) return { labels: [], values: [], metric: m, error: missing.error };
+
+      const rows = data
+        .map((v) => ({
+          date: typeof v?.release_date === 'string' ? v.release_date : null,
+          value: Number(v?.[m]),
+        }))
+        .filter((r) => r.date && Number.isFinite(r.value))
+        .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+
+      return {
+        labels: rows.map((r) => r.date),
+        values: rows.map((r) => r.value),
+        metric: m,
+      };
+    }
+
+    if (toolName === 'play_video') {
+      const missing = requireData();
+      if (missing) return { title: null, thumbnail_url: null, video_url: null, error: missing.error };
+
+      const st = args?.selection_type;
+      const value = args?.value;
+      const vids = [...data].filter((v) => v && typeof v === 'object');
+
+      const byViewsDesc = vids
+        .filter((v) => Number.isFinite(Number(v.view_count)))
+        .sort((a, b) => Number(b.view_count) - Number(a.view_count));
+
+      let picked = null;
+      if (st === 'most_viewed') {
+        picked = byViewsDesc[0] || null;
+      } else if (st === 'ordinal') {
+        const sorted = vids
+          .filter((v) => typeof v.release_date === 'string')
+          .sort((a, b) => String(a.release_date).localeCompare(String(b.release_date)));
+        const idx = Math.max(0, Number(value) - 1);
+        picked = sorted[idx] || null;
+      } else if (st === 'title') {
+        const q = String(value || '').trim().toLowerCase();
+        if (!q) return { title: null, thumbnail_url: null, video_url: null, error: 'Missing title value' };
+        const scored = vids
+          .map((v) => {
+            const t = String(v.title || '').toLowerCase();
+            let score = 0;
+            if (t === q) score += 100;
+            if (t.includes(q)) score += 50;
+            // token overlap
+            const qt = q.split(/\s+/).filter(Boolean);
+            for (const tok of qt) if (tok.length >= 3 && t.includes(tok)) score += 5;
+            return { v, score };
+          })
+          .sort((a, b) => b.score - a.score);
+        picked = scored[0]?.v || null;
+      } else {
+        return { title: null, thumbnail_url: null, video_url: null, error: 'Invalid selection_type' };
+      }
+
+      if (!picked) return { title: null, thumbnail_url: null, video_url: null, error: 'No matching video found' };
+
+      return {
+        title: picked.title || null,
+        thumbnail_url: picked.thumbnail_url || null,
+        video_url: picked.video_url || null,
+      };
+    }
+
+    if (toolName === 'generateImage') {
+      const prompt = String(args?.prompt || '').trim();
+      if (!prompt) return { base64_image: null, mimeType: null, error: 'Missing prompt' };
+
+      const anchor =
+        typeof args?.anchorImageBase64 === 'string' && args.anchorImageBase64.trim()
+          ? args.anchorImageBase64.trim()
+          : capturedImagesForAnchor?.[0]?.data || null;
+
+      const apiKey = process.env.REACT_APP_GEMINI_API_KEY || '';
+      if (!apiKey) return { base64_image: null, mimeType: null, error: 'Missing REACT_APP_GEMINI_API_KEY' };
+
+      const body = {
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { text: prompt },
+              ...(anchor ? [{ inlineData: { mimeType: 'image/png', data: anchor } }] : []),
+            ],
+          },
+        ],
+      };
+
+      const resp = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key=${encodeURIComponent(apiKey)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        }
+      );
+      const json = await resp.json();
+      if (!resp.ok) {
+        return { base64_image: null, mimeType: null, error: json?.error?.message || 'Image generation failed' };
+      }
+
+      const parts = json?.candidates?.[0]?.content?.parts || [];
+      const imgPart = parts.find((p) => p.inlineData?.data && p.inlineData?.mimeType?.startsWith('image/'));
+      if (!imgPart) return { base64_image: null, mimeType: null, error: 'No image returned' };
+
+      return { base64_image: imgPart.inlineData.data, mimeType: imgPart.inlineData.mimeType };
+    }
+
+    return { error: `Unknown tool: ${toolName}` };
+  };
 
   // On a brand-new chat: create the session and have the AI send the first greeting.
   // This ensures the first assistant message is AI-generated (not hardcoded UI text).
@@ -181,7 +423,8 @@ export default function Chat({ user, onLogout }) {
       let fullContent = '';
       let structuredParts = null;
       try {
-        for await (const chunk of streamChat([], 'Start this new chat with a friendly greeting.', [], false, user)) {
+        const channelContextInstruction = buildChannelContextInstruction(channelData);
+        for await (const chunk of streamChat([], 'Start this new chat with a friendly greeting.', [], false, user, channelContextInstruction)) {
           if (abortRef.current) break;
           if (chunk.type === 'text') {
             fullContent += chunk.text;
@@ -306,7 +549,31 @@ export default function Chat({ user, onLogout }) {
     const files = [...e.dataTransfer.files];
 
     const csvFiles = files.filter((f) => f.name.endsWith('.csv') || f.type === 'text/csv');
+    const jsonFiles = files.filter((f) => f.name.toLowerCase().endsWith('.json') || f.type === 'application/json');
     const imageFiles = files.filter((f) => f.type.startsWith('image/'));
+
+    if (jsonFiles.length > 0) {
+      const file = jsonFiles[0];
+      try {
+        const text = await fileToText(file);
+        const { ok, data, error } = parseChannelJson(text);
+        if (!ok) {
+          setChannelDataError(error || 'Invalid JSON file.');
+        } else {
+          setChannelData(data);
+          setChannelDataError('');
+          try {
+            localStorage.setItem('channelData', JSON.stringify(data));
+          } catch {
+            // ignore storage limits
+          }
+        }
+      } catch {
+        setChannelDataError('Could not read/parse that JSON file. Please upload a valid channel JSON array.');
+      }
+      // If a JSON file was dropped, treat it as the primary action (don’t also ingest CSV/images).
+      return;
+    }
 
     if (csvFiles.length > 0) {
       const file = csvFiles[0];
@@ -401,6 +668,8 @@ export default function Chat({ user, onLogout }) {
     const text = input.trim();
     if ((!text && !images.length && !csvContext) || streaming || !activeSessionId) return;
 
+    const channelContextInstruction = buildChannelContextInstruction(channelData);
+
     // Lazily create the session in DB on the very first message
     let sessionId = activeSessionId;
     if (sessionId === 'new') {
@@ -427,6 +696,12 @@ export default function Chat({ user, onLogout }) {
     //   else            — Google Search streaming (also used for "tell me about this file")
     const useTools = !!sessionCsvRows && !wantPythonOnly && !wantCode && !capturedCsv;
     const useCodeExecution = wantPythonOnly || wantCode;
+    const useRequiredTools =
+      !!channelData ||
+      /\b(plot|graph|chart)\b/i.test(text) ||
+      /\baverage|mean|median|std|min|max\b/i.test(text) ||
+      /\bplay\b.*\bvideo\b/i.test(text) ||
+      /\bgenerate\b.*\bimage\b|\bthumbnail\b.*\bimage\b|\bcreate\b.*\bimage\b/i.test(text);
 
     // ── Build prompt ─────────────────────────────────────────────────────────
     // sessionSummary: auto-computed column stats, included with every message
@@ -509,6 +784,8 @@ ${sessionSummary}${slimCsvBlock}
     let structuredParts = null;
     let toolCharts = [];
     let toolCalls = [];
+    let generatedImages = [];
+    let videoCard = null;
 
     try {
       if (useTools) {
@@ -519,7 +796,8 @@ ${sessionSummary}${slimCsvBlock}
           promptForGemini,
           sessionCsvHeaders,
           (toolName, args) => executeTool(toolName, args, sessionCsvRows),
-          user
+          user,
+          channelContextInstruction
         );
         fullContent = answer;
         toolCharts = returnedCharts || [];
@@ -538,9 +816,59 @@ ${sessionSummary}${slimCsvBlock}
               : msg
           )
         );
+      } else if (useRequiredTools) {
+        const { text: answer, toolCalls: returnedCalls } = await chatWithFunctionTools(
+          history,
+          promptForGemini,
+          REQUIRED_CHAT_TOOL_DECLARATIONS,
+          (toolName, args) => executeRequiredTool(toolName, args, capturedImages),
+          user,
+          channelContextInstruction
+        );
+        fullContent = answer;
+        toolCalls = returnedCalls || [];
+
+        for (const tc of toolCalls) {
+          if (tc.name === 'plot_metric_vs_time' && tc.result?.labels && tc.result?.values) {
+            toolCharts.push({
+              _chartType: 'metric_time',
+              metric: tc.result.metric,
+              labels: tc.result.labels,
+              values: tc.result.values,
+            });
+          }
+          if (tc.name === 'generateImage' && tc.result?.base64_image && tc.result?.mimeType) {
+            generatedImages.push({
+              data: tc.result.base64_image,
+              mimeType: tc.result.mimeType,
+            });
+          }
+          if (tc.name === 'play_video' && tc.result?.video_url) {
+            videoCard = {
+              title: tc.result.title,
+              thumbnail_url: tc.result.thumbnail_url,
+              video_url: tc.result.video_url,
+            };
+          }
+        }
+
+        setMessages((m) =>
+          m.map((msg) =>
+            msg.id === assistantId
+              ? {
+                  ...msg,
+                  content: fullContent,
+                  charts: toolCharts.length ? toolCharts : undefined,
+                  toolCalls: toolCalls.length ? toolCalls : undefined,
+                  generatedImages: generatedImages.length ? generatedImages : undefined,
+                  videoCard: videoCard || undefined,
+                }
+              : msg
+          )
+        );
       } else {
         // ── Streaming path: code execution or search ─────────────────────────
-        for await (const chunk of streamChat(history, promptForGemini, imageParts, useCodeExecution, user)) {
+        for await (const chunk of streamChat(history, promptForGemini, imageParts, useCodeExecution, user, channelContextInstruction)) {
           if (abortRef.current) break;
           if (chunk.type === 'text') {
             fullContent += chunk.text;
@@ -699,6 +1027,24 @@ ${sessionSummary}${slimCsvBlock}
               onDragLeave={() => setDragOver(false)}
               onDrop={handleDrop}
             >
+              {/* Channel JSON indicator */}
+              {(channelDataError || channelData) && (
+                <div className="channel-json-banner">
+                  {channelData ? (
+                    <>
+                      <span className="channel-json-text">
+                        Channel data loaded: <b>{channelData.length}</b> videos
+                      </span>
+                      <button type="button" className="channel-json-clear" onClick={clearChannelData}>
+                        Clear
+                      </button>
+                    </>
+                  ) : (
+                    <span className="channel-json-error">{channelDataError}</span>
+                  )}
+                </div>
+              )}
+
               {messages.map((m) => (
                 <div key={m.id} className={`chat-msg ${m.role}`}>
                   <div className="chat-msg-meta">
@@ -767,6 +1113,37 @@ ${sessionSummary}${slimCsvBlock}
                 </details>
               )}
 
+              {/* Generated image(s) from tools */}
+              {m.generatedImages?.length > 0 &&
+                m.generatedImages.map((img, gi) => (
+                  <div key={gi}>
+                    <div
+                      className="tool-image"
+                      onClick={() => setModal({ type: 'image', mimeType: img.mimeType, data: img.data })}
+                      role="button"
+                      tabIndex={0}
+                    >
+                      <img src={`data:${img.mimeType};base64,${img.data}`} alt="Generated" />
+                    </div>
+                    <div className="tool-media-row">
+                      <button
+                        className="tool-media-btn"
+                        onClick={() =>
+                          downloadBase64(img.data, img.mimeType, `generated_image_${m.id}_${gi}.png`)
+                        }
+                      >
+                        Download
+                      </button>
+                      <button
+                        className="tool-media-btn"
+                        onClick={() => setModal({ type: 'image', mimeType: img.mimeType, data: img.data })}
+                      >
+                        Enlarge
+                      </button>
+                    </div>
+                  </div>
+                ))}
+
               {/* Engagement charts from tool calls */}
               {m.charts?.map((chart, ci) =>
                 chart._chartType === 'engagement' ? (
@@ -775,7 +1152,48 @@ ${sessionSummary}${slimCsvBlock}
                     data={chart.data}
                     metricColumn={chart.metricColumn}
                   />
+                ) : chart._chartType === 'metric_time' ? (
+                  <div key={ci}>
+                    <div
+                      id={`metric-chart-${m.id}-${ci}`}
+                      onClick={() => setModal({ type: 'chart', chart })}
+                      role="button"
+                      tabIndex={0}
+                    >
+                      <MetricTimeChart
+                        data={chart.labels.map((d, i) => ({ date: d, value: chart.values[i] }))}
+                        metric={chart.metric}
+                      />
+                    </div>
+                    <div className="tool-media-row">
+                      <button
+                        className="tool-media-btn"
+                        onClick={async () => {
+                          const root = document.getElementById(`metric-chart-${m.id}-${ci}`);
+                          const svg = root?.querySelector('svg');
+                          if (!svg) return;
+                          const pngUrl = await svgElementToPngDataUrl(svg, 2);
+                          downloadDataUrl(pngUrl, `${chart.metric || 'metric'}_vs_time.png`);
+                        }}
+                      >
+                        Download PNG
+                      </button>
+                      <button className="tool-media-btn" onClick={() => setModal({ type: 'chart', chart })}>
+                        Enlarge
+                      </button>
+                    </div>
+                  </div>
                 ) : null
+              )}
+
+              {/* Video card from tool */}
+              {m.videoCard?.video_url && (
+                <a className="video-card" href={m.videoCard.video_url} target="_blank" rel="noreferrer">
+                  {m.videoCard.thumbnail_url && (
+                    <img className="video-card-thumb" src={m.videoCard.thumbnail_url} alt="" />
+                  )}
+                  <div className="video-card-title">{m.videoCard.title || 'Open video'}</div>
+                </a>
               )}
 
               {/* Search sources */}
@@ -880,6 +1298,70 @@ ${sessionSummary}${slimCsvBlock}
                 )}
               </div>
             </div>
+
+            {/* Modal (image/chart enlarge) */}
+            {modal && (
+              <div className="modal-overlay" onClick={() => setModal(null)}>
+                <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+                  <div className="modal-header">
+                    <div className="modal-title">
+                      {modal.type === 'image'
+                        ? 'Image'
+                        : modal.type === 'chart'
+                        ? `${modal.chart?.metric || 'Metric'} vs time`
+                        : 'Preview'}
+                    </div>
+                    <button className="modal-close" onClick={() => setModal(null)}>
+                      Close
+                    </button>
+                  </div>
+
+                  {modal.type === 'image' && (
+                    <>
+                      <img
+                        src={`data:${modal.mimeType};base64,${modal.data}`}
+                        alt="Enlarged"
+                        style={{ width: '100%', borderRadius: 12, border: '1px solid rgba(255,255,255,0.1)' }}
+                      />
+                      <div className="tool-media-row">
+                        <button
+                          className="tool-media-btn"
+                          onClick={() => downloadBase64(modal.data, modal.mimeType, 'generated_image.png')}
+                        >
+                          Download
+                        </button>
+                      </div>
+                    </>
+                  )}
+
+                  {modal.type === 'chart' && modal.chart && (
+                    <>
+                      <div id="modal-metric-chart">
+                        <MetricTimeChart
+                          data={modal.chart.labels.map((d, i) => ({ date: d, value: modal.chart.values[i] }))}
+                          metric={modal.chart.metric}
+                          height={420}
+                        />
+                      </div>
+                      <div className="tool-media-row">
+                        <button
+                          className="tool-media-btn"
+                          onClick={async () => {
+                            const root = document.getElementById('modal-metric-chart');
+                            const svg = root?.querySelector('svg');
+                            if (!svg) return;
+                            const pngUrl = await svgElementToPngDataUrl(svg, 2);
+                            downloadDataUrl(pngUrl, `${modal.chart.metric || 'metric'}_vs_time.png`);
+                          }}
+                        >
+                          Download PNG
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
           </>
         )}
       </div>
